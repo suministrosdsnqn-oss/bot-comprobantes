@@ -37,7 +37,7 @@ def extraer_datos(image_data):
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
-                {"type": "text", "text": 'Extraé del comprobante: nombre, apellido y monto. Respondé SOLO JSON sin texto extra: {"nombre": "...", "apellido": "...", "monto": 1234.0}. Si no encontras un dato usa null. Monto solo numeros.'}
+                {"type": "text", "text": "Extrae nombre, apellido y monto del comprobante. Responde SOLO JSON: {\"nombre\": \"...\", \"apellido\": \"...\", \"monto\": 1234.0}. Si no encuentras un dato usa null. Monto solo numeros sin simbolos."}
             ]
         }]
     )
@@ -49,18 +49,7 @@ async def handle_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         foto = update.message.photo[-1]
         archivo = await context.bot.get_file(foto.file_id)
         imagen = bytes(await archivo.download_as_bytearray())
-        await update.message.reply_text("📷 Procesando comprobante...")
+        await update.message.reply_text("Procesando comprobante...")
         datos_comp = extraer_datos(imagen)
-        nombre = (datos_comp.get("nombre") or "")
-        apellido = (datos_comp.get("apellido") or "")
-        monto = datos_comp.get("monto") or 0
-        nombre_completo = f"{nombre} {apellido}".strip() or "Desconocido"
-        hoy = fecha_hoy()
-        datos = cargar_datos()
-        if hoy not in datos:
-            datos[hoy] = []
-        datos[hoy].append({"nombre": nombre_completo, "monto": monto, "hora": hora_ahora()})
-        guardar_datos(datos)
-        total = sum(c["monto"] for c in datos[hoy])
-        cant = len(datos[hoy])
-        texto = f"✅ *{nombre_completo}* — ${monto:,.0f}\n📊 *Total hoy:* ${total:,.0f} ({c
+        nombre = datos_comp.get("nombre") or ""
+        apellido = datos_comp.get("apellido") or ""
