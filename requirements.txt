@@ -1,4 +1,0 @@
-python-telegram-bot==20.7
-anthropic==0.25.0
-httpx==0.25.2
-psycopg2-binary==2.9.9
