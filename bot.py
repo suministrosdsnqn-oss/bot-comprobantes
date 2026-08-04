@@ -1,4 +1,4 @@
-import os, json, logging, base64, urllib.parse
+import os, json, logging, base64, urllib.parse, time
 from datetime import datetime
 import pg8000
 from telegram import Update
@@ -26,8 +26,18 @@ def get_conn():
     p = parse_db_url()
     return pg8000.connect(host=p["host"], port=p["port"], database=p["database"], user=p["user"], password=p["password"])
 
+def get_conn_retry(intentos=3):
+    for i in range(intentos):
+        try:
+            return get_conn()
+        except Exception as e:
+            if i < intentos - 1:
+                time.sleep(2)
+            else:
+                raise e
+
 def init_db():
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS saldo (id INTEGER PRIMARY KEY, monto FLOAT DEFAULT 0)")
     cur.execute("CREATE TABLE IF NOT EXISTS comprobantes (id SERIAL PRIMARY KEY, fecha TEXT, hora TEXT, tipo TEXT, envia TEXT, recibe TEXT, cuenta TEXT, monto_original FLOAT, monto_neto FLOAT, comision FLOAT, monto_egreso FLOAT, nro_comprobante TEXT)")
@@ -37,7 +47,7 @@ def init_db():
     conn.close()
 
 def cargar_saldo():
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("SELECT monto FROM saldo WHERE id = 1")
     row = cur.fetchone()
@@ -46,7 +56,7 @@ def cargar_saldo():
     return row[0] if row else 0
 
 def guardar_saldo(monto):
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("UPDATE saldo SET monto = %s WHERE id = 1", (monto,))
     conn.commit()
@@ -54,7 +64,7 @@ def guardar_saldo(monto):
     conn.close()
 
 def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante):
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     hoy = datetime.now().strftime("%Y-%m-%d")
     hora = datetime.now().strftime("%H:%M")
@@ -65,7 +75,7 @@ def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto,
     conn.close()
 
 def es_duplicado(nombre_envia, monto, nro_comprobante):
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     if nro_comprobante:
         cur.execute("SELECT fecha, hora FROM comprobantes WHERE nro_comprobante = %s AND ABS((monto_original + monto_egreso) - %s) < 1",
@@ -83,7 +93,7 @@ def es_duplicado(nombre_envia, monto, nro_comprobante):
 
 def get_comprobantes_hoy():
     hoy = datetime.now().strftime("%Y-%m-%d")
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("SELECT tipo, envia, recibe, monto_neto, monto_egreso, hora FROM comprobantes WHERE fecha = %s ORDER BY hora", (hoy,))
     rows = cur.fetchall()
@@ -92,7 +102,7 @@ def get_comprobantes_hoy():
     return rows
 
 def get_historial():
-    conn = get_conn()
+    conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("SELECT fecha, SUM(CASE WHEN tipo = 'ingreso' THEN monto_neto ELSE 0 END), SUM(CASE WHEN tipo = 'egreso' THEN monto_egreso ELSE 0 END) FROM comprobantes WHERE fecha >= CURRENT_DATE - INTERVAL '7 days' GROUP BY fecha ORDER BY fecha DESC")
     rows = cur.fetchall()
@@ -132,33 +142,47 @@ def detectar_cuenta_destino(cvu):
 def formatear_pesos(monto):
     return "$" + "{:,.0f}".format(monto).replace(",", ".")
 
-def extraer_datos_imagen(image_data):
+def extraer_datos_imagen(image_data, intentos=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     img64 = base64.standard_b64encode(image_data).decode("utf-8")
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
-            {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
-        ]}]
-    )
-    texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(texto)
+    for i in range(intentos):
+        try:
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
+                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                ]}]
+            )
+            texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            return json.loads(texto)
+        except Exception as e:
+            if i < intentos - 1:
+                time.sleep(2)
+            else:
+                raise e
 
-def extraer_datos_pdf(pdf_data):
+def extraer_datos_pdf(pdf_data, intentos=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     pdf64 = base64.standard_b64encode(pdf_data).decode("utf-8")
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        messages=[{"role": "user", "content": [
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf64}},
-            {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
-        ]}]
-    )
-    texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(texto)
+    for i in range(intentos):
+        try:
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                messages=[{"role": "user", "content": [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf64}},
+                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                ]}]
+            )
+            texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            return json.loads(texto)
+        except Exception as e:
+            if i < intentos - 1:
+                time.sleep(2)
+            else:
+                raise e
 
 async def procesar_y_guardar(update, datos_comp):
     nombre_envia = ((datos_comp.get("nombre_envia") or "") + " " + (datos_comp.get("apellido_envia") or "")).strip() or "Desconocido"
@@ -213,7 +237,7 @@ async def handle_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await procesar_y_guardar(update, datos_comp)
     except Exception as e:
         logger.error(str(e))
-        await update.message.reply_text("Error: " + str(e))
+        await update.message.reply_text("Error al procesar. Por favor reintenta en unos segundos.")
 
 async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -228,7 +252,7 @@ async def handle_documento(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await procesar_y_guardar(update, datos_comp)
     except Exception as e:
         logger.error(str(e))
-        await update.message.reply_text("Error: " + str(e))
+        await update.message.reply_text("Error al procesar. Por favor reintenta en unos segundos.")
 
 async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saldo = cargar_saldo()
