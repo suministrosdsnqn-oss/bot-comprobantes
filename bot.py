@@ -1,5 +1,6 @@
 import os, json, logging, base64, urllib.parse, time
 from datetime import datetime
+from difflib import SequenceMatcher
 import pg8000
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -90,6 +91,25 @@ def es_duplicado(nombre_envia, monto, nro_comprobante):
     if row:
         return True, row[0] + " " + row[1]
     return False, None
+
+def es_posible_duplicado_ingreso(nombre_envia, monto):
+    """Chequeo mas laxo que es_duplicado(): mismo dia + mismo monto exacto + nombre de
+    emisor parecido (no necesariamente igual). No bloquea el ingreso, solo alerta,
+    porque el OCR puede leer el nro_comprobante o el nombre distinto para el mismo
+    comprobante real (ver casos Pierina Bramati Digilio y Graciela Lopez Clair)."""
+    hoy = datetime.now().strftime("%Y-%m-%d")
+    conn = get_conn_retry()
+    cur = conn.cursor()
+    cur.execute("SELECT envia, hora, nro_comprobante FROM comprobantes WHERE tipo = 'ingreso' AND fecha = %s AND ABS(monto_original - %s) < 1",
+        (hoy, monto))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    for envia_prev, hora_prev, nro_prev in rows:
+        similitud = SequenceMatcher(None, nombre_envia.lower(), (envia_prev or "").lower()).ratio()
+        if similitud >= 0.5:
+            return True, envia_prev, hora_prev
+    return False, None, None
 
 def get_comprobantes_hoy():
     hoy = datetime.now().strftime("%Y-%m-%d")
@@ -212,8 +232,13 @@ async def procesar_y_guardar(update, datos_comp):
         saldo = saldo + monto_neto
         guardar_saldo(saldo)
         cuenta_label = cuenta_destino if cuenta_destino else "Cuenta"
+        posible_dup, envia_prev, hora_prev = es_posible_duplicado_ingreso(nombre_envia, monto_original)
         guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante)
         lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
+        if posible_dup:
+            lineas.append("")
+            lineas.append("⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️")
+            lineas.append("Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" hoy a las " + hora_prev + ". Revisar si es el mismo comprobante.")
         await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
     elif envia_titular and not recibe_titular:
