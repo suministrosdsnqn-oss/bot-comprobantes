@@ -43,6 +43,8 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS saldo (id INTEGER PRIMARY KEY, monto FLOAT DEFAULT 0)")
     cur.execute("CREATE TABLE IF NOT EXISTS comprobantes (id SERIAL PRIMARY KEY, fecha TEXT, hora TEXT, tipo TEXT, envia TEXT, recibe TEXT, cuenta TEXT, monto_original FLOAT, monto_neto FLOAT, comision FLOAT, monto_egreso FLOAT, nro_comprobante TEXT)")
     cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'confirmado'")
+    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS fecha_transferencia TEXT")
+    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS hora_transferencia TEXT")
     cur.execute("INSERT INTO saldo (id, monto) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
     conn.commit()
     cur.close()
@@ -65,13 +67,13 @@ def guardar_saldo(monto):
     cur.close()
     conn.close()
 
-def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado="confirmado"):
+def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia=None, hora_transferencia=None, estado="confirmado"):
     conn = get_conn_retry()
     cur = conn.cursor()
     hoy = datetime.now().strftime("%Y-%m-%d")
     hora = datetime.now().strftime("%H:%M")
-    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado))
+    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia, hora_transferencia, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia, hora_transferencia, estado))
     nuevo_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
@@ -121,23 +123,40 @@ def es_duplicado(nombre_envia, monto, nro_comprobante):
         return True, row[0] + " " + row[1]
     return False, None
 
-def es_posible_duplicado_ingreso(nombre_envia, monto):
-    """Chequeo mas laxo que es_duplicado(): mismo dia + mismo monto exacto + nombre de
-    emisor parecido (no necesariamente igual). No bloquea el ingreso, solo alerta,
-    porque el OCR puede leer el nro_comprobante o el nombre distinto para el mismo
-    comprobante real (ver casos Pierina Bramati Digilio y Graciela Lopez Clair)."""
-    hoy = datetime.now().strftime("%Y-%m-%d")
+def codigos_parecidos(a, b):
+    """Exacto, o muy similar como caracteres (ej: el OCR confundio un digito:
+    17335545870 vs 17335545987). Codigos cortos no se comparan por similitud
+    para no dar falsos positivos con textos genericos."""
+    if not a or not b:
+        return False
+    a, b = str(a).strip(), str(b).strip()
+    if a == b:
+        return True
+    if len(a) < 6 or len(b) < 6:
+        return False
+    return SequenceMatcher(None, a, b).ratio() >= 0.75
+
+def es_posible_duplicado_ingreso(nombre_envia, monto, nro_comprobante, cuenta_label, fecha_transferencia, hora_transferencia):
+    """Busca en TODO el historial (no solo hoy), porque a veces reenvian el mismo
+    comprobante un dia despues sin darse cuenta. Requiere mismo monto y mismo banco/
+    destino, y ADEMAS que coincida alguna de estas: mismo id (o muy parecido), o
+    misma fecha+hora REAL de la transferencia (la que figura impresa en el
+    comprobante, no cuando se lo mando al bot)."""
     conn = get_conn_retry()
     cur = conn.cursor()
-    cur.execute("SELECT envia, hora, nro_comprobante FROM comprobantes WHERE tipo = 'ingreso' AND fecha = %s AND ABS(monto_original - %s) < 1 AND estado != 'rechazado'",
-        (hoy, monto))
+    cur.execute("SELECT envia, fecha, hora, nro_comprobante, cuenta, fecha_transferencia, hora_transferencia FROM comprobantes WHERE tipo = 'ingreso' AND ABS(monto_original - %s) < 1 AND estado != 'rechazado'",
+        (monto,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    for envia_prev, hora_prev, nro_prev in rows:
-        similitud = SequenceMatcher(None, nombre_envia.lower(), (envia_prev or "").lower()).ratio()
-        if similitud >= 0.5:
-            return True, envia_prev, hora_prev
+    for envia_prev, fecha_prev, hora_prev, nro_prev, cuenta_prev, ft_prev, ht_prev in rows:
+        if (cuenta_prev or "") != (cuenta_label or ""):
+            continue
+        mismo_id = codigos_parecidos(nro_comprobante, nro_prev)
+        misma_fecha_hora_real = bool(fecha_transferencia and hora_transferencia and ft_prev and ht_prev
+            and fecha_transferencia == ft_prev and hora_transferencia == ht_prev)
+        if mismo_id or misma_fecha_hora_real:
+            return True, envia_prev, fecha_prev + " " + hora_prev
     return False, None, None
 
 def get_comprobantes_hoy():
@@ -201,7 +220,7 @@ def extraer_datos_imagen(image_data, intentos=3):
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
-                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\", \"fecha_transferencia\": \"AAAA-MM-DD\", \"hora_transferencia\": \"HH:MM\"}. fecha_transferencia y hora_transferencia son la fecha y hora REALES que figuran impresas en el comprobante (cuando se hizo la transferencia), no la fecha de hoy. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
                 ]}]
             )
             texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
@@ -222,7 +241,7 @@ def extraer_datos_pdf(pdf_data, intentos=3):
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf64}},
-                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\"}. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\", \"fecha_transferencia\": \"AAAA-MM-DD\", \"hora_transferencia\": \"HH:MM\"}. fecha_transferencia y hora_transferencia son la fecha y hora REALES que figuran impresas en el comprobante (cuando se hizo la transferencia), no la fecha de hoy. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
                 ]}]
             )
             texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
@@ -239,6 +258,8 @@ async def procesar_y_guardar(update, datos_comp):
     monto_original = limpiar_monto(datos_comp.get("monto"))
     nro_comprobante = datos_comp.get("nro_comprobante") or None
     cvu_destino = datos_comp.get("cvu_destino") or None
+    fecha_transferencia = datos_comp.get("fecha_transferencia") or None
+    hora_transferencia = datos_comp.get("hora_transferencia") or None
 
     cuenta_destino, comision_rate = detectar_cuenta_destino(cvu_destino)
     envia_titular = nombre_es_titular(nombre_envia)
@@ -259,15 +280,15 @@ async def procesar_y_guardar(update, datos_comp):
         comision = monto_original * comision_rate
         monto_neto = monto_original - comision
         cuenta_label = cuenta_destino if cuenta_destino else "Cuenta"
-        posible_dup, envia_prev, hora_prev = es_posible_duplicado_ingreso(nombre_envia, monto_original)
+        posible_dup, envia_prev, cuando_prev = es_posible_duplicado_ingreso(nombre_envia, monto_original, nro_comprobante, cuenta_label, fecha_transferencia, hora_transferencia)
 
         if posible_dup:
-            nuevo_id = guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, estado="pendiente")
-            lineas = ["⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️", "", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto: " + formatear_pesos(monto_original), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "", "Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" hoy a las " + hora_prev + ".", "", "*NO se sumo al saldo todavia.* Saldo actual: " + formatear_pesos(saldo), "", "Si es plata nueva (no duplicado): /confirmar " + str(nuevo_id), "Si es el mismo comprobante repetido: /rechazar " + str(nuevo_id)]
+            nuevo_id = guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, fecha_transferencia, hora_transferencia, estado="pendiente")
+            lineas = ["⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️", "", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto: " + formatear_pesos(monto_original), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "", "Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" (procesado el " + cuando_prev + ").", "", "*NO se sumo al saldo todavia.* Saldo actual: " + formatear_pesos(saldo), "", "Si es plata nueva (no duplicado): /confirmar " + str(nuevo_id), "Si es el mismo comprobante repetido: /rechazar " + str(nuevo_id)]
         else:
             saldo = saldo + monto_neto
             guardar_saldo(saldo)
-            guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante)
+            guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, fecha_transferencia, hora_transferencia)
             lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
         await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
