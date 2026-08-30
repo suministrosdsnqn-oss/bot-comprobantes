@@ -123,6 +123,20 @@ def es_duplicado(nombre_envia, monto, nro_comprobante):
         return True, row[0] + " " + row[1]
     return False, None
 
+def normalizar_nombre(n):
+    return " ".join((n or "").upper().split())
+
+def nombres_coinciden(a, b):
+    """Exacto, o uno contiene todas las palabras del otro (ej: falta/sobra un
+    segundo nombre, como 'GRACIELA LOPEZ CLAIR' vs 'GRACIELA NOEMI LOPEZ CLAIR')."""
+    na, nb = normalizar_nombre(a), normalizar_nombre(b)
+    if not na or not nb or na == "DESCONOCIDO" or nb == "DESCONOCIDO":
+        return False
+    if na == nb:
+        return True
+    palabras_a, palabras_b = set(na.split()), set(nb.split())
+    return palabras_a.issubset(palabras_b) or palabras_b.issubset(palabras_a)
+
 def codigos_parecidos(a, b):
     """Exacto, o muy similar como caracteres (ej: el OCR confundio un digito:
     17335545870 vs 17335545987). Codigos cortos no se comparan por similitud
@@ -139,9 +153,11 @@ def codigos_parecidos(a, b):
 def es_posible_duplicado_ingreso(nombre_envia, monto, nro_comprobante, cuenta_label, fecha_transferencia, hora_transferencia):
     """Busca en TODO el historial (no solo hoy), porque a veces reenvian el mismo
     comprobante un dia despues sin darse cuenta. Requiere mismo monto y mismo banco/
-    destino, y ADEMAS que coincida alguna de estas: mismo id (o muy parecido), o
-    misma fecha+hora REAL de la transferencia (la que figura impresa en el
-    comprobante, no cuando se lo mando al bot)."""
+    destino, y ADEMAS que coincida alguna de estas: mismo id (o muy parecido), misma
+    fecha+hora REAL de la transferencia (la que figura impresa en el comprobante), o
+    mismo nombre del emisor PERO solo si fue hace poco (<=90 dias) - si pasaron mas
+    dias probablemente es una cuota nueva de la misma persona, no un duplicado."""
+    hoy = datetime.now().date()
     conn = get_conn_retry()
     cur = conn.cursor()
     cur.execute("SELECT envia, fecha, hora, nro_comprobante, cuenta, fecha_transferencia, hora_transferencia FROM comprobantes WHERE tipo = 'ingreso' AND ABS(monto_original - %s) < 1 AND estado != 'rechazado'",
@@ -155,7 +171,14 @@ def es_posible_duplicado_ingreso(nombre_envia, monto, nro_comprobante, cuenta_la
         mismo_id = codigos_parecidos(nro_comprobante, nro_prev)
         misma_fecha_hora_real = bool(fecha_transferencia and hora_transferencia and ft_prev and ht_prev
             and fecha_transferencia == ft_prev and hora_transferencia == ht_prev)
-        if mismo_id or misma_fecha_hora_real:
+        mismo_nombre_reciente = False
+        if nombres_coinciden(nombre_envia, envia_prev):
+            try:
+                fecha_prev_date = datetime.strptime(fecha_prev, "%Y-%m-%d").date()
+                mismo_nombre_reciente = abs((hoy - fecha_prev_date).days) <= 90
+            except Exception:
+                pass
+        if mismo_id or misma_fecha_hora_real or mismo_nombre_reciente:
             return True, envia_prev, fecha_prev + " " + hora_prev
     return False, None, None
 
