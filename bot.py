@@ -42,6 +42,7 @@ def init_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS saldo (id INTEGER PRIMARY KEY, monto FLOAT DEFAULT 0)")
     cur.execute("CREATE TABLE IF NOT EXISTS comprobantes (id SERIAL PRIMARY KEY, fecha TEXT, hora TEXT, tipo TEXT, envia TEXT, recibe TEXT, cuenta TEXT, monto_original FLOAT, monto_neto FLOAT, comision FLOAT, monto_egreso FLOAT, nro_comprobante TEXT)")
+    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'confirmado'")
     cur.execute("INSERT INTO saldo (id, monto) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
     conn.commit()
     cur.close()
@@ -64,16 +65,44 @@ def guardar_saldo(monto):
     cur.close()
     conn.close()
 
-def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante):
+def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado="confirmado"):
     conn = get_conn_retry()
     cur = conn.cursor()
     hoy = datetime.now().strftime("%Y-%m-%d")
     hora = datetime.now().strftime("%H:%M")
-    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante))
+    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, estado))
+    nuevo_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
+    return nuevo_id
+
+def get_pendiente(comp_id):
+    conn = get_conn_retry()
+    cur = conn.cursor()
+    cur.execute("SELECT envia, monto_neto, estado FROM comprobantes WHERE id = %s AND tipo = 'ingreso'", (comp_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+def resolver_pendiente(comp_id, nuevo_estado):
+    conn = get_conn_retry()
+    cur = conn.cursor()
+    cur.execute("UPDATE comprobantes SET estado = %s WHERE id = %s", (nuevo_estado, comp_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_pendientes():
+    conn = get_conn_retry()
+    cur = conn.cursor()
+    cur.execute("SELECT id, fecha, hora, envia, monto_original FROM comprobantes WHERE estado = 'pendiente' ORDER BY fecha, hora")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 def es_duplicado(nombre_envia, monto, nro_comprobante):
     conn = get_conn_retry()
@@ -100,7 +129,7 @@ def es_posible_duplicado_ingreso(nombre_envia, monto):
     hoy = datetime.now().strftime("%Y-%m-%d")
     conn = get_conn_retry()
     cur = conn.cursor()
-    cur.execute("SELECT envia, hora, nro_comprobante FROM comprobantes WHERE tipo = 'ingreso' AND fecha = %s AND ABS(monto_original - %s) < 1",
+    cur.execute("SELECT envia, hora, nro_comprobante FROM comprobantes WHERE tipo = 'ingreso' AND fecha = %s AND ABS(monto_original - %s) < 1 AND estado != 'rechazado'",
         (hoy, monto))
     rows = cur.fetchall()
     cur.close()
@@ -229,16 +258,17 @@ async def procesar_y_guardar(update, datos_comp):
             comision_rate = COMISION_COPTER
         comision = monto_original * comision_rate
         monto_neto = monto_original - comision
-        saldo = saldo + monto_neto
-        guardar_saldo(saldo)
         cuenta_label = cuenta_destino if cuenta_destino else "Cuenta"
         posible_dup, envia_prev, hora_prev = es_posible_duplicado_ingreso(nombre_envia, monto_original)
-        guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante)
-        lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
+
         if posible_dup:
-            lineas.append("")
-            lineas.append("⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️")
-            lineas.append("Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" hoy a las " + hora_prev + ". Revisar si es el mismo comprobante.")
+            nuevo_id = guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, estado="pendiente")
+            lineas = ["⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️", "", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto: " + formatear_pesos(monto_original), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "", "Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" hoy a las " + hora_prev + ".", "", "*NO se sumo al saldo todavia.* Saldo actual: " + formatear_pesos(saldo), "", "Si es plata nueva (no duplicado): /confirmar " + str(nuevo_id), "Si es el mismo comprobante repetido: /rechazar " + str(nuevo_id)]
+        else:
+            saldo = saldo + monto_neto
+            guardar_saldo(saldo)
+            guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante)
+            lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
         await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
     elif envia_titular and not recibe_titular:
@@ -323,9 +353,57 @@ async def cmd_setear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Uso correcto: /setear 500000")
 
+async def cmd_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        comp_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Uso correcto: /confirmar ID (el numero que te paso el aviso)")
+        return
+    row = get_pendiente(comp_id)
+    if not row:
+        await update.message.reply_text("No encontre ese comprobante pendiente (ID " + str(comp_id) + ").")
+        return
+    envia, monto_neto, estado = row
+    if estado != "pendiente":
+        await update.message.reply_text("Ese comprobante ya fue resuelto antes (estado: " + estado + ").")
+        return
+    saldo = cargar_saldo() + monto_neto
+    guardar_saldo(saldo)
+    resolver_pendiente(comp_id, "confirmado")
+    await update.message.reply_text("Confirmado. Se sumo el ingreso de " + envia + ".\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
+
+async def cmd_rechazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        comp_id = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Uso correcto: /rechazar ID (el numero que te paso el aviso)")
+        return
+    row = get_pendiente(comp_id)
+    if not row:
+        await update.message.reply_text("No encontre ese comprobante pendiente (ID " + str(comp_id) + ").")
+        return
+    envia, monto_neto, estado = row
+    if estado != "pendiente":
+        await update.message.reply_text("Ese comprobante ya fue resuelto antes (estado: " + estado + ").")
+        return
+    resolver_pendiente(comp_id, "rechazado")
+    saldo = cargar_saldo()
+    await update.message.reply_text("Rechazado como duplicado. No se sumo al saldo.\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
+
+async def cmd_pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_pendientes()
+    if not rows:
+        await update.message.reply_text("No hay comprobantes pendientes de revisar.")
+        return
+    lineas = ["*Pendientes de confirmar*\n"]
+    for comp_id, fecha, hora, envia, monto in rows:
+        lineas.append("ID " + str(comp_id) + " - " + fecha + " " + hora + " - " + envia + " - " + formatear_pesos(monto))
+    lineas.append("\nUsa /confirmar ID o /rechazar ID para cada uno.")
+    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saldo = cargar_saldo()
-    await update.message.reply_text("*Bot de comprobantes activo*\n\nManda una foto o PDF de un comprobante y lo proceso automaticamente.\n\nComandos:\n/saldo - ver saldo actual\n/resumen - movimientos de hoy\n/historial - ultimos 7 dias\n/setear 500000 - establecer saldo inicial\n/resetear - poner saldo en 0\n\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
+    await update.message.reply_text("*Bot de comprobantes activo*\n\nManda una foto o PDF de un comprobante y lo proceso automaticamente.\n\nComandos:\n/saldo - ver saldo actual\n/resumen - movimientos de hoy\n/historial - ultimos 7 dias\n/pendientes - ver posibles duplicados sin resolver\n/confirmar ID - sumar un pendiente (no era duplicado)\n/rechazar ID - descartar un pendiente (si era duplicado)\n/setear 500000 - establecer saldo inicial\n/resetear - poner saldo en 0\n\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
 
 if __name__ == "__main__":
     init_db()
@@ -336,6 +414,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("historial", cmd_historial))
     app.add_handler(CommandHandler("resetear", cmd_resetear))
     app.add_handler(CommandHandler("setear", cmd_setear))
+    app.add_handler(CommandHandler("confirmar", cmd_confirmar))
+    app.add_handler(CommandHandler("rechazar", cmd_rechazar))
+    app.add_handler(CommandHandler("pendientes", cmd_pendientes))
     app.add_handler(MessageHandler(filters.PHOTO, handle_foto))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_documento))
     logger.info("Bot iniciado!")
