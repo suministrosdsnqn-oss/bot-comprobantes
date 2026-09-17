@@ -1,6 +1,5 @@
 import os, json, logging, base64, urllib.parse, time
 from datetime import datetime
-from difflib import SequenceMatcher
 import pg8000
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -42,9 +41,6 @@ def init_db():
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS saldo (id INTEGER PRIMARY KEY, monto FLOAT DEFAULT 0)")
     cur.execute("CREATE TABLE IF NOT EXISTS comprobantes (id SERIAL PRIMARY KEY, fecha TEXT, hora TEXT, tipo TEXT, envia TEXT, recibe TEXT, cuenta TEXT, monto_original FLOAT, monto_neto FLOAT, comision FLOAT, monto_egreso FLOAT, nro_comprobante TEXT)")
-    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS estado TEXT DEFAULT 'confirmado'")
-    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS fecha_transferencia TEXT")
-    cur.execute("ALTER TABLE comprobantes ADD COLUMN IF NOT EXISTS hora_transferencia TEXT")
     cur.execute("INSERT INTO saldo (id, monto) VALUES (1, 0) ON CONFLICT (id) DO NOTHING")
     conn.commit()
     cur.close()
@@ -67,44 +63,16 @@ def guardar_saldo(monto):
     cur.close()
     conn.close()
 
-def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia=None, hora_transferencia=None, estado="confirmado"):
+def guardar_comprobante(tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante):
     conn = get_conn_retry()
     cur = conn.cursor()
     hoy = datetime.now().strftime("%Y-%m-%d")
     hora = datetime.now().strftime("%H:%M")
-    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia, hora_transferencia, estado) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante, fecha_transferencia, hora_transferencia, estado))
-    nuevo_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO comprobantes (fecha, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (hoy, hora, tipo, envia, recibe, cuenta, monto_original, monto_neto, comision, monto_egreso, nro_comprobante))
     conn.commit()
     cur.close()
     conn.close()
-    return nuevo_id
-
-def get_pendiente(comp_id):
-    conn = get_conn_retry()
-    cur = conn.cursor()
-    cur.execute("SELECT envia, monto_neto, estado FROM comprobantes WHERE id = %s AND tipo = 'ingreso'", (comp_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row
-
-def resolver_pendiente(comp_id, nuevo_estado):
-    conn = get_conn_retry()
-    cur = conn.cursor()
-    cur.execute("UPDATE comprobantes SET estado = %s WHERE id = %s", (nuevo_estado, comp_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def get_pendientes():
-    conn = get_conn_retry()
-    cur = conn.cursor()
-    cur.execute("SELECT id, fecha, hora, envia, monto_original FROM comprobantes WHERE estado = 'pendiente' ORDER BY fecha, hora")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
 
 def es_duplicado(nombre_envia, monto, nro_comprobante):
     conn = get_conn_retry()
@@ -122,65 +90,6 @@ def es_duplicado(nombre_envia, monto, nro_comprobante):
     if row:
         return True, row[0] + " " + row[1]
     return False, None
-
-def normalizar_nombre(n):
-    return " ".join((n or "").upper().split())
-
-def nombres_coinciden(a, b):
-    """Exacto, o uno contiene todas las palabras del otro (ej: falta/sobra un
-    segundo nombre, como 'GRACIELA LOPEZ CLAIR' vs 'GRACIELA NOEMI LOPEZ CLAIR')."""
-    na, nb = normalizar_nombre(a), normalizar_nombre(b)
-    if not na or not nb or na == "DESCONOCIDO" or nb == "DESCONOCIDO":
-        return False
-    if na == nb:
-        return True
-    palabras_a, palabras_b = set(na.split()), set(nb.split())
-    return palabras_a.issubset(palabras_b) or palabras_b.issubset(palabras_a)
-
-def codigos_parecidos(a, b):
-    """Exacto, o muy similar como caracteres (ej: el OCR confundio un digito:
-    17335545870 vs 17335545987). Codigos cortos no se comparan por similitud
-    para no dar falsos positivos con textos genericos."""
-    if not a or not b:
-        return False
-    a, b = str(a).strip(), str(b).strip()
-    if a == b:
-        return True
-    if len(a) < 6 or len(b) < 6:
-        return False
-    return SequenceMatcher(None, a, b).ratio() >= 0.75
-
-def es_posible_duplicado_ingreso(nombre_envia, monto, nro_comprobante, cuenta_label, fecha_transferencia, hora_transferencia):
-    """Busca en TODO el historial (no solo hoy), porque a veces reenvian el mismo
-    comprobante un dia despues sin darse cuenta. Requiere mismo monto y mismo banco/
-    destino, y ADEMAS que coincida alguna de estas: mismo id (o muy parecido), misma
-    fecha+hora REAL de la transferencia (la que figura impresa en el comprobante), o
-    mismo nombre del emisor PERO solo si fue hace poco (<=90 dias) - si pasaron mas
-    dias probablemente es una cuota nueva de la misma persona, no un duplicado."""
-    hoy = datetime.now().date()
-    conn = get_conn_retry()
-    cur = conn.cursor()
-    cur.execute("SELECT envia, fecha, hora, nro_comprobante, cuenta, fecha_transferencia, hora_transferencia FROM comprobantes WHERE tipo = 'ingreso' AND ABS(monto_original - %s) < 1 AND estado != 'rechazado'",
-        (monto,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    for envia_prev, fecha_prev, hora_prev, nro_prev, cuenta_prev, ft_prev, ht_prev in rows:
-        if (cuenta_prev or "") != (cuenta_label or ""):
-            continue
-        mismo_id = codigos_parecidos(nro_comprobante, nro_prev)
-        misma_fecha_hora_real = bool(fecha_transferencia and hora_transferencia and ft_prev and ht_prev
-            and fecha_transferencia == ft_prev and hora_transferencia == ht_prev)
-        mismo_nombre_reciente = False
-        if nombres_coinciden(nombre_envia, envia_prev):
-            try:
-                fecha_prev_date = datetime.strptime(fecha_prev, "%Y-%m-%d").date()
-                mismo_nombre_reciente = abs((hoy - fecha_prev_date).days) <= 90
-            except Exception:
-                pass
-        if mismo_id or misma_fecha_hora_real or mismo_nombre_reciente:
-            return True, envia_prev, fecha_prev + " " + hora_prev
-    return False, None, None
 
 def get_comprobantes_hoy():
     hoy = datetime.now().strftime("%Y-%m-%d")
@@ -206,8 +115,22 @@ def limpiar_monto(monto_raw):
         return 0
     if isinstance(monto_raw, (int, float)):
         return float(monto_raw)
-    monto_str = str(monto_raw).replace("$", "").replace(" ", "")
-    monto_str = monto_str.replace(".", "").replace(",", ".")
+    monto_str = str(monto_raw).strip()
+    # Detectar formato argentino: 469.379,00 o 469.379
+    # Si tiene coma, es separador decimal argentino
+    if "," in monto_str:
+        # Formato: 469.379,00 -> sacar puntos de miles, reemplazar coma por punto
+        monto_str = monto_str.replace(".", "").replace(",", ".")
+    else:
+        # Sin coma: puede ser 469379 o 469.379 (punto de miles)
+        # Si tiene punto y mas de 3 digitos despues, es decimal
+        # Si tiene punto y exactamente 3 digitos despues, es miles
+        partes = monto_str.split(".")
+        if len(partes) == 2 and len(partes[1]) == 3:
+            # Es separador de miles: 469.379 -> 469379
+            monto_str = monto_str.replace(".", "")
+        # else: dejar como esta (469379.50 es decimal)
+    monto_str = monto_str.replace("$", "").replace(" ", "").replace(".", "", monto_str.count(".") - 1) if monto_str.count(".") > 1 else monto_str.replace("$", "").replace(" ", "")
     try:
         return float(monto_str)
     except Exception:
@@ -236,6 +159,14 @@ def formatear_pesos(monto):
 def extraer_datos_imagen(image_data, intentos=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     img64 = base64.standard_b64encode(image_data).decode("utf-8")
+    prompt = """Analiza este comprobante de transferencia bancaria argentina.
+IMPORTANTE para el monto: Los comprobantes argentinos usan punto como separador de miles y coma como decimal.
+Ejemplo: $469.379,00 significa CUATROCIENTOS SESENTA Y NUEVE MIL TRESCIENTOS SETENTA Y NUEVE pesos.
+Devuelve el monto como numero entero sin puntos ni comas. Ejemplo: 469379
+
+Responde SOLO JSON sin texto extra:
+{"nombre_envia": "...", "apellido_envia": "...", "nombre_recibe": "...", "apellido_recibe": "...", "monto": 469379, "nro_comprobante": "...", "cvu_destino": "..."}
+Si no encuentras un dato usa null."""
     for i in range(intentos):
         try:
             msg = client.messages.create(
@@ -243,7 +174,7 @@ def extraer_datos_imagen(image_data, intentos=3):
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
-                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\", \"fecha_transferencia\": \"AAAA-MM-DD\", \"hora_transferencia\": \"HH:MM\"}. fecha_transferencia y hora_transferencia son la fecha y hora REALES que figuran impresas en el comprobante (cuando se hizo la transferencia), no la fecha de hoy. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                    {"type": "text", "text": prompt}
                 ]}]
             )
             texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
@@ -257,6 +188,14 @@ def extraer_datos_imagen(image_data, intentos=3):
 def extraer_datos_pdf(pdf_data, intentos=3):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     pdf64 = base64.standard_b64encode(pdf_data).decode("utf-8")
+    prompt = """Analiza este comprobante de transferencia bancaria argentina.
+IMPORTANTE para el monto: Los comprobantes argentinos usan punto como separador de miles y coma como decimal.
+Ejemplo: $469.379,00 significa CUATROCIENTOS SESENTA Y NUEVE MIL TRESCIENTOS SETENTA Y NUEVE pesos.
+Devuelve el monto como numero entero sin puntos ni comas. Ejemplo: 469379
+
+Responde SOLO JSON sin texto extra:
+{"nombre_envia": "...", "apellido_envia": "...", "nombre_recibe": "...", "apellido_recibe": "...", "monto": 469379, "nro_comprobante": "...", "cvu_destino": "..."}
+Si no encuentras un dato usa null."""
     for i in range(intentos):
         try:
             msg = client.messages.create(
@@ -264,7 +203,7 @@ def extraer_datos_pdf(pdf_data, intentos=3):
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf64}},
-                    {"type": "text", "text": "Analiza este comprobante de transferencia bancaria. Responde SOLO JSON sin texto extra: {\"nombre_envia\": \"...\", \"apellido_envia\": \"...\", \"nombre_recibe\": \"...\", \"apellido_recibe\": \"...\", \"monto\": 1234.0, \"nro_comprobante\": \"...\", \"cvu_destino\": \"...\", \"fecha_transferencia\": \"AAAA-MM-DD\", \"hora_transferencia\": \"HH:MM\"}. fecha_transferencia y hora_transferencia son la fecha y hora REALES que figuran impresas en el comprobante (cuando se hizo la transferencia), no la fecha de hoy. Si no encuentras un dato usa null. El monto debe ser solo numeros sin puntos de miles ni comas."}
+                    {"type": "text", "text": prompt}
                 ]}]
             )
             texto = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
@@ -281,8 +220,6 @@ async def procesar_y_guardar(update, datos_comp):
     monto_original = limpiar_monto(datos_comp.get("monto"))
     nro_comprobante = datos_comp.get("nro_comprobante") or None
     cvu_destino = datos_comp.get("cvu_destino") or None
-    fecha_transferencia = datos_comp.get("fecha_transferencia") or None
-    hora_transferencia = datos_comp.get("hora_transferencia") or None
 
     cuenta_destino, comision_rate = detectar_cuenta_destino(cvu_destino)
     envia_titular = nombre_es_titular(nombre_envia)
@@ -302,17 +239,11 @@ async def procesar_y_guardar(update, datos_comp):
             comision_rate = COMISION_COPTER
         comision = monto_original * comision_rate
         monto_neto = monto_original - comision
+        saldo = saldo + monto_neto
+        guardar_saldo(saldo)
         cuenta_label = cuenta_destino if cuenta_destino else "Cuenta"
-        posible_dup, envia_prev, cuando_prev = es_posible_duplicado_ingreso(nombre_envia, monto_original, nro_comprobante, cuenta_label, fecha_transferencia, hora_transferencia)
-
-        if posible_dup:
-            nuevo_id = guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, fecha_transferencia, hora_transferencia, estado="pendiente")
-            lineas = ["⚠️ *POSIBLE ACREDITACION DUPLICADA - VERIFICAR* ⚠️", "", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto: " + formatear_pesos(monto_original), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "", "Ya hay un ingreso de " + formatear_pesos(monto_original) + " de \"" + envia_prev + "\" (procesado el " + cuando_prev + ").", "", "*NO se sumo al saldo todavia.* Saldo actual: " + formatear_pesos(saldo), "", "Si es plata nueva (no duplicado): /confirmar " + str(nuevo_id), "Si es el mismo comprobante repetido: /rechazar " + str(nuevo_id)]
-        else:
-            saldo = saldo + monto_neto
-            guardar_saldo(saldo)
-            guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante, fecha_transferencia, hora_transferencia)
-            lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
+        guardar_comprobante("ingreso", nombre_envia, nombre_recibe, cuenta_label, monto_original, monto_neto, comision, 0, nro_comprobante)
+        lineas = ["*INGRESO - " + cuenta_label + "*", "De: " + nombre_envia, "Para: " + nombre_recibe, "Monto recibido: " + formatear_pesos(monto_original), "Monto neto: " + formatear_pesos(monto_neto), "Nro comprobante: " + str(nro_comprobante or "no encontrado"), "*Saldo actual: " + formatear_pesos(saldo) + "*"]
         await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
 
     elif envia_titular and not recibe_titular:
@@ -397,57 +328,9 @@ async def cmd_setear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Uso correcto: /setear 500000")
 
-async def cmd_confirmar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        comp_id = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Uso correcto: /confirmar ID (el numero que te paso el aviso)")
-        return
-    row = get_pendiente(comp_id)
-    if not row:
-        await update.message.reply_text("No encontre ese comprobante pendiente (ID " + str(comp_id) + ").")
-        return
-    envia, monto_neto, estado = row
-    if estado != "pendiente":
-        await update.message.reply_text("Ese comprobante ya fue resuelto antes (estado: " + estado + ").")
-        return
-    saldo = cargar_saldo() + monto_neto
-    guardar_saldo(saldo)
-    resolver_pendiente(comp_id, "confirmado")
-    await update.message.reply_text("Confirmado. Se sumo el ingreso de " + envia + ".\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
-
-async def cmd_rechazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        comp_id = int(context.args[0])
-    except Exception:
-        await update.message.reply_text("Uso correcto: /rechazar ID (el numero que te paso el aviso)")
-        return
-    row = get_pendiente(comp_id)
-    if not row:
-        await update.message.reply_text("No encontre ese comprobante pendiente (ID " + str(comp_id) + ").")
-        return
-    envia, monto_neto, estado = row
-    if estado != "pendiente":
-        await update.message.reply_text("Ese comprobante ya fue resuelto antes (estado: " + estado + ").")
-        return
-    resolver_pendiente(comp_id, "rechazado")
-    saldo = cargar_saldo()
-    await update.message.reply_text("Rechazado como duplicado. No se sumo al saldo.\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
-
-async def cmd_pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = get_pendientes()
-    if not rows:
-        await update.message.reply_text("No hay comprobantes pendientes de revisar.")
-        return
-    lineas = ["*Pendientes de confirmar*\n"]
-    for comp_id, fecha, hora, envia, monto in rows:
-        lineas.append("ID " + str(comp_id) + " - " + fecha + " " + hora + " - " + envia + " - " + formatear_pesos(monto))
-    lineas.append("\nUsa /confirmar ID o /rechazar ID para cada uno.")
-    await update.message.reply_text("\n".join(lineas), parse_mode="Markdown")
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     saldo = cargar_saldo()
-    await update.message.reply_text("*Bot de comprobantes activo*\n\nManda una foto o PDF de un comprobante y lo proceso automaticamente.\n\nComandos:\n/saldo - ver saldo actual\n/resumen - movimientos de hoy\n/historial - ultimos 7 dias\n/pendientes - ver posibles duplicados sin resolver\n/confirmar ID - sumar un pendiente (no era duplicado)\n/rechazar ID - descartar un pendiente (si era duplicado)\n/setear 500000 - establecer saldo inicial\n/resetear - poner saldo en 0\n\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
+    await update.message.reply_text("*Bot de comprobantes activo*\n\nManda una foto o PDF de un comprobante y lo proceso automaticamente.\n\nComandos:\n/saldo - ver saldo actual\n/resumen - movimientos de hoy\n/historial - ultimos 7 dias\n/setear 500000 - establecer saldo inicial\n/resetear - poner saldo en 0\n\n*Saldo actual: " + formatear_pesos(saldo) + "*", parse_mode="Markdown")
 
 if __name__ == "__main__":
     init_db()
@@ -458,9 +341,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("historial", cmd_historial))
     app.add_handler(CommandHandler("resetear", cmd_resetear))
     app.add_handler(CommandHandler("setear", cmd_setear))
-    app.add_handler(CommandHandler("confirmar", cmd_confirmar))
-    app.add_handler(CommandHandler("rechazar", cmd_rechazar))
-    app.add_handler(CommandHandler("pendientes", cmd_pendientes))
     app.add_handler(MessageHandler(filters.PHOTO, handle_foto))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_documento))
     logger.info("Bot iniciado!")
