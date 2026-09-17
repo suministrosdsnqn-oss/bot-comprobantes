@@ -170,7 +170,7 @@ Si no encuentras un dato usa null."""
     for i in range(intentos):
         try:
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-6",
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img64}},
@@ -199,7 +199,7 @@ Si no encuentras un dato usa null."""
     for i in range(intentos):
         try:
             msg = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-4-6",
                 max_tokens=500,
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf64}},
